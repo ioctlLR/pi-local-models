@@ -43,4 +43,4 @@ Values reported by the server's `/v1/models` take priority over the config file,
 | `pricing` (per token) | cost |
 | `reasoning_effort` (from [llama-server-router](https://github.com/kkuroma/llama-server-router)) | reasoning, supported thinking levels, and how thinking is turned off |
 
-When a model reports `reasoning_effort.default`, selecting that model sets pi's thinking level to it.
+When a model reports `reasoning_effort.default`, selecting that model (or starting a fresh session on it) sets pi's thinking level to it, unless you chose one yourself with `--thinking`, a `--model id:level` suffix, or a per-model level saved in pi's settings.

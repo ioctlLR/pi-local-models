@@ -7,7 +7,7 @@
 // - Windows: %USERPROFILE%/.pi/agent/local-models.json
 // - macOs/Linux: ~/.pi/agent/local-models.json
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "os";
 import { join } from "node:path";
@@ -193,24 +193,70 @@ export default async function (pi: ExtensionAPI) {
         models
     });
 
-    // Apply the server's default effort when a local model is picked. Restored sessions keep their own level.
+    // Apply the server's default effort when a local model is picked or a fresh session starts on one.
+    // It ranks below anything the user chose: --thinking, a "model:level" suffix, or a per-model
+    // level saved in pi settings. Restored sessions keep their own level.
     const defaults = new Map<string, EffortLevel>();
     for (const m of serverModels) {
         const level = m.reasoning_effort?.default;
         if (isEffortLevel(level) && m.reasoning_effort?.levels?.includes(level))
             defaults.set(String(m.id), level);
     }
-    pi.on("model_select", (event) => {
-        if (event.source === "restore" || event.model.provider !== PROVIDER)
-            return;
-        const level = defaults.get(event.model.id);
-        if (level)
+    const applyDefault = (modelId: string, ctx: ExtensionContext) => {
+        const level = defaults.get(modelId);
+        if (level && !userThinkingLevelFor(ctx, modelId))
             pi.setThinkingLevel(level);
+    };
+    pi.on("model_select", (event, ctx) => {
+        if (event.source !== "restore" && event.model.provider === PROVIDER)
+            applyDefault(event.model.id, ctx);
+    });
+    pi.on("session_start", (event, ctx) => {
+        if ((event.reason !== "startup" && event.reason !== "new") || ctx.model?.provider !== PROVIDER)
+            return;
+        if (thinkingLevelFromArgs() || ctx.sessionManager.getEntries().some((e) => e.type === "message"))
+            return;
+        applyDefault(ctx.model.id, ctx);
     });
 };
 
 function isEffortLevel(level: unknown): level is EffortLevel {
     return EFFORT_LEVELS.includes(level as EffortLevel);
+}
+
+// A thinking level given on the command line, via --thinking or a --model "id:level" suffix
+function thinkingLevelFromArgs(): string | undefined {
+    const args = process.argv;
+    for (let i = 0; i < args.length - 1; i++) {
+        const value = args[i + 1];
+        if (args[i] === "--thinking")
+            return value;
+        if (args[i] === "--model") {
+            const suffix = value.match(/:(off|minimal|low|medium|high|xhigh|max)$/);
+            if (suffix)
+                return suffix[1];
+        }
+    }
+    return undefined;
+}
+
+// The per-model thinking level saved in pi settings. Project settings win over global ones,
+// and count only when pi trusts the project.
+function userThinkingLevelFor(ctx: ExtensionContext, modelId: string): string | undefined {
+    const key = `${PROVIDER}/${modelId}`;
+    const files = [join(homedir(), ".pi", "agent", "settings.json")];
+    if (ctx.isProjectTrusted())
+        files.unshift(join(ctx.cwd, ".pi", "settings.json"));
+    for (const file of files) {
+        try {
+            const level = JSON.parse(readFileSync(file, "utf-8")).modelThinkingLevels?.[key];
+            if (typeof level === "string")
+                return level;
+        } catch {
+            // Missing or unreadable settings: nothing saved there
+        }
+    }
+    return undefined;
 }
 
 function inputModalities(m: ServerModel): Modality[] | undefined {
