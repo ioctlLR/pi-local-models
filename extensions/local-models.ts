@@ -12,17 +12,24 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "os";
 import { join } from "node:path";
 
+const PROVIDER = "local-model";
 const DEFAULT_CTX_WINDOW = 128000;
 const DEFAULT_MAX_TOKENS = 16384;
-const DEFAULT_INPUT = ["text"];
+const DEFAULT_INPUT: Modality[] = ["text"];
 
+// Pi's thinking levels above "off", least to most intensive
+const EFFORT_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+type EffortLevel = typeof EFFORT_LEVELS[number];
+type Modality = "text" | "image";
+
+// Config values are fallbacks: anything the server reports per model takes priority
 interface LocalModelsConfig {
     url: string;
     apiKey?: string;
     contextWindow?: number,
     maxTokens?: number,
-    reasoning: boolean,
-    input?: string[],
+    reasoning?: boolean,
+    input?: Modality[],
 }
 
 interface LoadingPayload {
@@ -31,11 +38,34 @@ interface LoadingPayload {
     value?: number;
 }
 
+// Reasoning capabilities, as reported by llama-server-router
+interface ServerReasoningEffort {
+    levels?: string[];
+    // How thinking is turned off: "none" -> reasoning_effort "none",
+    // "lowest" -> the lowest level, "qwen" -> chat_template_kwargs.enable_thinking false.
+    // Absent: thinking cannot be turned off.
+    disable?: "none" | "lowest" | "qwen";
+    default?: string;
+}
+
+// OpenRouter-style per-token prices, as decimal strings
+interface ServerPricing {
+    prompt?: string;
+    completion?: string;
+    input_cache_read?: string;
+    cache_write?: string;
+}
+
 interface ServerModel {
     id: string;
     state?: string;
     context_length?: number;
     max_model_len?: number;
+    max_output_tokens?: number;
+    meta?: { n_ctx?: number };
+    architecture?: { input_modalities?: string[] };
+    reasoning_effort?: ServerReasoningEffort;
+    pricing?: ServerPricing;
     payload?: LoadingPayload;
     status?: {
         value?: string;
@@ -59,9 +89,9 @@ function readConfig(cwd: string): LocalModelsConfig {
     let url: string = '';
     let apiKey: string | undefined = undefined;
     let contextWindow: number | undefined = undefined;
-    let maxTokens: number = DEFAULT_MAX_TOKENS;
-    let input: string[] = DEFAULT_INPUT;
-    let reasoning: boolean = false;
+    let maxTokens: number | undefined = undefined;
+    let input: Modality[] | undefined = undefined;
+    let reasoning: boolean | undefined = undefined;
     if (cfg.url) {
         // Remove trailing v1
         url = cfg.url;
@@ -81,8 +111,8 @@ function readConfig(cwd: string): LocalModelsConfig {
     if (cfg.maxTokens)
         maxTokens = cfg.maxTokens;
 
-    if (cfg.reasoning)
-        reasoning = cfg.reasoning;
+    if (cfg.reasoning !== undefined)
+        reasoning = !!cfg.reasoning;
 
     if (cfg.input)
         input = cfg.input;
@@ -149,21 +179,109 @@ export default async function (pi: ExtensionAPI) {
     const models = serverModels.map((m) => ({
         id: String(m.id),
         name: String(m.id),
-        reasoning: config.reasoning,
-        input: config.input,
-        contextWindow: m.context_length ?? m.max_model_len ?? config.contextWindow ?? DEFAULT_CTX_WINDOW,
-        maxTokens: config.maxTokens,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        compat: {
-            supportsDeveloperRole: false,
-            supportsReasoningEffort: false,
-        }
+        input: inputModalities(m) ?? config.input ?? DEFAULT_INPUT,
+        contextWindow: m.context_length ?? m.max_model_len ?? m.meta?.n_ctx ?? config.contextWindow ?? DEFAULT_CTX_WINDOW,
+        maxTokens: m.max_output_tokens ?? config.maxTokens ?? DEFAULT_MAX_TOKENS,
+        cost: cost(m.pricing),
+        ...reasoning(m, config),
     }));
 
-    pi.registerProvider("local-model", {
+    pi.registerProvider(PROVIDER, {
         baseUrl: `${config.url}/v1`,
         api: "openai-completions",
         apiKey: config.apiKey ?? "not-needed",
         models
     });
+
+    // Apply the server's default effort when a local model is picked. Restored sessions keep their own level.
+    const defaults = new Map<string, EffortLevel>();
+    for (const m of serverModels) {
+        const level = m.reasoning_effort?.default;
+        if (isEffortLevel(level) && m.reasoning_effort?.levels?.includes(level))
+            defaults.set(String(m.id), level);
+    }
+    pi.on("model_select", (event) => {
+        if (event.source === "restore" || event.model.provider !== PROVIDER)
+            return;
+        const level = defaults.get(event.model.id);
+        if (level)
+            pi.setThinkingLevel(level);
+    });
 };
+
+function isEffortLevel(level: unknown): level is EffortLevel {
+    return EFFORT_LEVELS.includes(level as EffortLevel);
+}
+
+function inputModalities(m: ServerModel): Modality[] | undefined {
+    const reported = m.architecture?.input_modalities;
+    if (!reported)
+        return undefined;
+    const input = reported.filter((x): x is Modality => x === "text" || x === "image");
+    return input.length > 0 ? input : undefined;
+}
+
+// Server prices are per token; pi wants per million tokens
+function cost(pricing?: ServerPricing) {
+    const perMillion = (price?: string) => {
+        const n = Number(price);
+        return Number.isFinite(n) && n > 0 ? Number((n * 1e6).toPrecision(12)) : 0;
+    };
+    return {
+        input: perMillion(pricing?.prompt),
+        output: perMillion(pricing?.completion),
+        cacheRead: perMillion(pricing?.input_cache_read),
+        cacheWrite: perMillion(pricing?.cache_write),
+    };
+}
+
+// Without a server-reported reasoning surface, fall back to the config's on/off flag with pi's default levels
+function reasoning(m: ServerModel, config: LocalModelsConfig) {
+    const levels = (m.reasoning_effort?.levels ?? []).filter(isEffortLevel);
+    if (levels.length === 0) {
+        return {
+            reasoning: config.reasoning ?? false,
+            compat: {
+                supportsDeveloperRole: false,
+                supportsReasoningEffort: false,
+            }
+        };
+    }
+
+    // Only the server's levels are offered; null hides a level from pi's selector
+    const thinkingLevelMap: Record<string, string | null> = {};
+    for (const level of EFFORT_LEVELS)
+        thinkingLevelMap[level] = levels.includes(level) ? level : null;
+
+    const disable = m.reasoning_effort?.disable;
+    if (disable === "none")
+        thinkingLevelMap.off = "none";
+    else if (disable === "lowest")
+        thinkingLevelMap.off = levels[0];
+    else if (disable !== "qwen")
+        thinkingLevelMap.off = null;
+
+    if (disable === "qwen") {
+        // Thinking is toggled through the chat template; the effort level is not sent
+        return {
+            reasoning: true,
+            thinkingLevelMap,
+            compat: {
+                supportsDeveloperRole: false,
+                supportsReasoningEffort: false,
+                thinkingFormat: "chat-template" as const,
+                chatTemplateKwargs: { enable_thinking: { $var: "thinking.enabled" as const } },
+            }
+        };
+    }
+
+    return {
+        reasoning: true,
+        thinkingLevelMap,
+        compat: {
+            supportsDeveloperRole: false,
+            supportsReasoningEffort: true,
+            thinkingFormat: "openai" as const,
+        }
+    };
+}
